@@ -1,0 +1,377 @@
+---
+title: "Applying Machine Learning Models for Predicting Human Activity Performance"
+author: "Sheila Zhao"
+date: "17 June 2015"
+output: 
+    html_document
+---
+<br/>
+
+## Background
+Many people now regularly use personal activity tracking devices such as Jawbone Up, 
+Nike FuelBand, and Fitbit to quantify how much of a particular activity they do, 
+but these devices rarely quantify how well they do those activities. 
+
+The goal of this project is to show how machine learning models may be applied 
+for predicting the manner that a particular tracked activity was performed based
+on the motion measurement data that was collected from the sensors attached to the
+person performing the activity.  
+
+<br/>
+  
+## Dataset 
+The dataset used for this project is the Weight Lifting Exercise Dataset, taken 
+from a study in Qualitative Activity Recognition by Velloso, et al.   More 
+information on this study and the dataset are available from the website : 
+http://groupware.les.inf.puc-rio.br/har and the paper cited in the References 
+section.  
+
+The dataset contains sensor measurements taken from six young healthy participants 
+as they performed the Unilateral Dumbbell Biceps Curl in five different ways, and 
+records the manner they had performed the activity in a *classe* variable as follows:
+
+* Class A : performed exactly according to the specification
+* Class B : throwing the elbows to the front
+* Class C : lifting the dumbbell only halfway
+* Class D : lowering the dumbbell only halfway
+* Class E : throwing the hips to the front
+
+By training machine learning models for classification on this dataset, the fitted
+models could learn to predict the value of *classe* from the sensor measurements 
+recorded for new observations data.
+
+```{r Libraries, echo=FALSE, warning=FALSE, message=FALSE}
+library(knitr)
+Sys.setlocale('LC_ALL', 'English'); #If your system is not in English. 
+Sys.setenv(LANG = "en_US.UTF-8");
+opts_chunk$set(echo=TRUE, cache = TRUE)
+# Load the required libraries
+library(caret)
+library(ggplot2)
+library(rpart)
+library(rpart.plot)
+library(rattle)
+
+# enable multi-core processing
+library(doParallel)
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+```
+
+```{r DownLoadData, echo=FALSE, warning=FALSE, message=FALSE}
+# Check if the training and testing datasets are in the current working directory.
+# If not, download them from the URLs provided in the assignment.
+#
+if (!file.exists("pml-training.csv")) {
+        fileURL <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv" 
+        download.file(fileURL,destfile="pml-training.csv", method="curl")
+} 
+
+if (!file.exists("pml-testing.csv")) {
+        fileURL <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv" 
+        download.file(fileURL,destfile="pml-testing.csv", method="curl")
+} 
+```
+
+<br/>
+
+## Exploratory Data Analysis
+
+
+```{r ExploreData}
+# Load the raw training dataset from current working directory
+train_raw <- read.csv("pml-training.csv", na.strings=c("NA","#DIV/0!",""))
+
+# Check how many rows and columns per row in the dataset
+dim(train_raw)
+```
+
+After loading the training dataset, a quick check of the dataset showed that it comprised of `r nrow(train_raw)` records and each record has `r ncol(train_raw)`  columns.  
+
+We performed an exploratory scan of the dataset and we observed that there 
+are two types of records in the dataset:
+
+* observation records (new_window="no"), which records the measurements from the sensors 
+for the activity performed.
+* summary records (new_window=yes),  which aggregates the measurements into the 
+summary statistics columns for a given time window. 
+
+Here is some exploratory data analysis performed.
+```{r}
+head(train_raw[20:30,c(1:2, 5:10, 18:22,160)], 8)
+
+summary(train_raw$roll_belt)
+summary(train_raw$min_roll_belt)
+summary(train_raw$classe)
+```
+<br/>
+
+  
+We also observed that the records data of the five classe values are quite 
+evenly distributed across the entire dataset and also across the users who 
+performed the activities, as illustrated in the following plot.
+```{r, echo=FALSE, fig.height=5, fig.width=9}
+attach(train_raw)
+par(mfrow=c(1,2))
+plot(classe, main="Record Count by Classe", col=4:8, xlab="Classe", 
+     ylab="Record Count")
+plot(classe ~ user_name, main="Distribution of Classe by User", 
+     col=4:8, ylab="Classe", xlab="User")
+```  
+<br/>
+  
+## Data Cleansing and Preparation
+For the purpose of predicting the value of classe from the observed sensor data,
+only observation records are required.  Summary records are not required and 
+has to be removed from the training dataset.   
+
+Summary statistic columns of observation records have NA values, and shall be 
+removed as they are redundant for our prediction models.
+
+Finally, the first seven columns are dimensional data, which do not contribute to our prediction model.  They shall also be removed from the training dataset.
+
+
+```{r CleanData}
+# remove all summary records indicated by new_window=yes
+train_clean <- train_raw[train_raw$new_window == "no", ]
+
+# remove summary stats columns which have NA values in remaining observation records
+train_clean <- train_clean[,colSums(is.na(train_clean)) != nrow(train_clean)]
+
+# remove dimension columns not used in prediction model
+train_clean <- train_clean[,-c(1:7)]
+dim(train_clean)
+```
+After the data cleansing steps, the training dataset has `r nrow(train_clean)` records 
+remaining, and each cleansed record comprise of the response variable *classe*, 
+and `r ncol(train_clean)` predictor variables.
+<br/>
+
+## Partitioning Training Data for Cross-Validation
+In order to cross-validate the predictive accuracy of the classificatin models we
+will create and test, we need to first partition the cleansed training dataset.
+
+We will use 70% of the cleansed training dataset for model training, and set 
+aside 30% of the cleansed dataset as the validation dataset, which we will use 
+measuring the out-of-sample errors and comparing the prediction accuracy of our 
+prediction models we are building.
+
+```{r CreateDataPartitions}
+# split train_clean to train_ds and val_ds for cross validation 
+in_train <- createDataPartition(y=train_clean$classe, p=0.70, list=FALSE)
+train_ds <- train_clean[in_train,]       # 70% training   13453    53
+val_ds <- train_clean[-in_train,]        # 30% validation 5763   53
+```
+  
+<br/>  
+  
+## Model 1: Decision Tree Model 
+
+We first fitted a Decision Tree model to the training dataset , which is commonly used for classification problems and one of the easiest predictive models to understand .  
+
+### Model Training
+The tree model is fitted to the training dataset as follows, and the resulting 
+tree model fit is illustrated by the figure below.
+```{r RPart, fig.align='center',fig.width=9,fig.height=9}
+set.seed(12345)
+# fit the tree model to the training dataset
+rpart_fit <- rpart(classe ~ ., data=train_ds, method="class")
+
+# print the fitted tree
+fancyRpartPlot(rpart_fit, main="Decision Tree for Classe Prediction")
+```
+<br/>
+
+### Model Validation
+Using the fitted tree model for prediction on our validation dataset, 
+we found that the overall accuracy is only around 73.28%, with significant 
+misclassification errors for every value of *classe*.
+```{r}
+rpart_predicted <- predict(rpart_fit, newdata=val_ds, type="class")
+rpart_cm <- confusionMatrix(val_ds$classe, rpart_predicted)
+rpart_cm
+```
+
+<br/>
+  
+##  Model 2 - Random Forest Model Using All Predictors
+As another commonly used prediction model for classification problems, Random Forest model is known for its accuracy of prediction, but is both compute-expensive and more difficult to interpret.
+
+For our second prediction model, we chose a Random Forest model using all 52 predictor variables in the dataset and using 7 folds for cross validation.
+
+### Model Training
+Our resulting Random Forest model fit reported a very low out-of-sample estimate 
+of error rate of only **0.68%.**
+```{r Train RF-AllFeatures, eval=TRUE, message=FALSE}
+set.seed(12345)
+no_of_folds <- 7
+
+# Setting up the seeds argument for TrainControl to ensure reproducibility 
+seeds <- vector(mode = "list", length = no_of_folds)
+for(i in 1:no_of_folds) seeds[[i]] <- sample.int(1000, 3)
+seeds[[no_of_folds + 1]] <- sample.int(1000, 1)
+
+trc <- trainControl(method="cv", number=no_of_folds, seeds=seeds)
+
+rf_fit <- train(classe ~ ., method="rf", data=train_ds, ntrees=250, prox=FALSE,
+                trControl=trc)
+print(rf_fit$finalModel)
+```
+<br/>
+
+### Model Validation
+Fitting the trained Randowm Forest model to the validation dataset, we found that
+the Random Forest Model achieved a very high overall accuracy of **99.41%**, which 
+is much better than our first prediction model based on Decision Tree.
+```{r}
+rf_predicted <- predict(rf_fit, newdata=val_ds)
+rf_cm <- confusionMatrix(val_ds$classe, rf_predicted)
+rf_cm
+```
+  
+<br/>
+  
+## Model 3 - Random Forest Model Using Key Predictors
+
+For our third and final prediction model, we built a second Random Forest model using a smaller subset of the predictors, but achieving a comparable level of accuracy as the model using all 52 variables.
+
+### Feature Selection
+To select the predictors for the third model, we start by examining the variable 
+importance of our earlier Random Forest Model. We found that 13 of the 52 predictor 
+variables are the most important contributing variables to the prediction model.
+
+This is illustrated in the following variable importance plot.
+```{r Feature Selection, fig.width=8, fig.height=8, fig.align='center', eval=TRUE}
+rf_vi <- varImp(rf_fit)
+plot(rf_vi, main="Variable Importance for Random Forest Model Fit")
+
+imp <- rf_vi$importance
+imp_vars <- rownames(imp)[imp$Overall > 40]
+imp_vars
+```
+<br/>
+
+
+### Model Training
+We re-trained the Random Forest Model with the selected 7 key predictor 
+variables from the training dataset, and the resulting model fit still reported 
+a relatively low out-of-sample estimate of error rate of **1.47%**, even though the 
+training time is significantly less as compared to the full model.
+
+```{r Train RF-SelectFeatures, eval=TRUE}
+set.seed(12345)
+train_ds2 <- train_ds[,c("classe",imp_vars)]
+rf_fit2 <- train(classe ~ ., method="rf", data=train_ds2, ntrees=250, prox=FALSE,
+                trControl=trc)
+print(rf_fit2$finalModel)
+```
+
+### Model Validation
+Fitting this new Random Forest model to the validation dataset, we found that 
+the overall accuracy of our final Random Forest model is still very high, 
+around **98.63%**, and comparable to our first Random Forest model.
+```{r}
+rf_predicted2 <- predict(rf_fit2, newdata=val_ds)
+rf_cm2 <- confusionMatrix(val_ds$classe, rf_predicted2)
+rf_cm2
+```
+  
+<br/>
+  
+## Prediction on the Testing Dataset
+In this final section, we loaded the testing dataset and confirmed that
+the testing dataset contained 20 test cases, but the response variable *classe* 
+was missing, and replaced by another variable called **problem_id**.  As
+a result, we had to insert the *classe* column back into the dataset in line 
+with our fitted Random Forest model.
+
+```{r Test RF Model, eval=TRUE}
+test_raw <- read.csv("pml-testing.csv", na.strings=c("NA","#DIV/0!",""))
+dim(test_raw)
+
+test_ds <- test_raw
+test_ds$classe <- NA
+```
+
+<br/>
+
+After that, we fitted the testing dataset to our final Random Forest model using
+only the 7 selected key predictors and generated the predicted *classe* values for 
+the 20 test cases.
+```{r}
+set.seed(12345)
+problem_id <- test_ds$problem_id
+test_ds <- test_ds[,colnames(train_ds2)]
+predicted_classe <- predict(rf_fit2, newdata=test_ds)
+data.frame(problem_id, predicted_classe)
+```
+
+<br/>
+
+The predicted answers for all 20 test cases were submitted to Coursera web site 
+for checking, which confirmed the values of *classe* for all 20 test cases were 
+predicted correctly.
+
+```{r Export Answers to Files, echo=FALSE, eval=TRUE}
+# This is the function to export the predicted answers to files for submission
+# to Coursera.
+pml_write_files = function(x){
+    n = length(x)
+    for(i in 1:n){
+        filename = paste0("problem_id_",i,".txt")
+        write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+    }
+}
+
+setwd("Answers")
+pml_write_files(predicted_classe)
+```
+  
+<br/>
+  
+## Conclusions
+This project has shown how Decision Tree and Random Forest predictive 
+models can be applied for predicting the manner that a particular tracked 
+activity was performed from the motion measurement data that was collected from 
+the sensors attached to persons performing the activity.  
+
+Random Forest models achieved better predictive accuracy as compared to Decision Tree 
+models, but require much more computing resources to execute.
+
+Our final selected prediction model used the Random Forest model, which we trained 
+with the 7 most important variables.  It still achieved a high accuracy 
+of **98.75%**, and predicted all 20 test cases of the testing dataset correctly, 
+but consumed less computing resources as compared the full Random Forest model 
+using all 52 predictor variables.
+
+The validation results for the three prediction models are illustrated in the 
+following plot, which compares the prediction accuracy achieved by each prediction 
+model fitted against the validation dataset. 
+
+```{r, fig.align='center',fig.width=9,fig.height=4.5, echo=FALSE, eval=TRUE}
+par(mfrow=c(1,3))
+plot(val_ds$classe, rpart_predicted, col=4:8, 
+     xlab="Reference Classe Values", ylab="Predicted Classe Values",
+     main="Decision Tree Model")
+     
+plot(val_ds$classe, rf_predicted, col=4:8,
+     xlab="Reference Classe Values", ylab="",
+     main="Random Forest (All Predictors)")
+
+plot(val_ds$classe, rf_predicted2, col=4:8,
+     xlab="Reference Classe Values", ylab="",
+     main="Random Forest (7 Key Predictors)")
+```
+   
+<br/>
+From the plot, it is clear that the Random Forest Models predicts much more 
+accurately than the Decision Tree Model, but there is little difference in 
+overall accuracy achieved between the two Random Forest Models themselves.
+
+<br/>
+
+## References  
+
+1. Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+
+---
